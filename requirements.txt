@@ -1,0 +1,9 @@
+boto3
+
+# Private packages - for local development use editable install
+# For production deployment, replace with one of:
+#   - Private PyPI: package-name==1.0.0 (with --extra-index-url)
+#   - AWS CodeArtifact: package-name==1.0.0 (with pip configured)
+#   - Git URL: package-name @ git+https://github.com/org/package-name.git@v1.0.0
+-e ./packages/idempotency-lib
+-e ./packages/notification-lib

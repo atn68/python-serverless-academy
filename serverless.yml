@@ -1,0 +1,427 @@
+service: python-serverless-academy
+
+provider:
+  name: aws
+  runtime: python3.7
+  region: us-east-1
+  iam:
+    role:
+      statements:
+        # DynamoDB permissions for idempotency table
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource:
+            - !GetAtt IdempotencyTable.Arn
+        # DynamoDB permissions for notification table
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+          Resource:
+            - !GetAtt NotificationTable.Arn
+            - !Sub "${NotificationTable.Arn}/index/*"
+        # DynamoDB permissions for notification register table
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+          Resource:
+            - !GetAtt NotificationRegisterTable.Arn
+        # KMS permissions for notification encryption (customer managed key with data key caching)
+        - Effect: Allow
+          Action:
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:GenerateDataKey
+            - kms:DescribeKey
+          Resource:
+            - !GetAtt NotificationKmsKey.Arn
+        # SQS permissions
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:ChangeMessageVisibility
+          Resource:
+            - !GetAtt NotificationQueue.Arn
+            - !GetAtt NotificationFifoQueue.Arn
+        # EventBridge permissions
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource:
+            - !GetAtt NotificationEventBus.Arn
+        # SES permissions for email
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource: "*"
+        # SNS permissions for SMS
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource: "*"
+
+custom:
+  idempotency:
+    tableName: IdempotencyStore
+  payment:
+    idempotency:
+      pkPrefix: PAYMENT#IDEM
+      ttlSeconds: 86400  # 24 hours
+  notification:
+    tableName: Notification
+    registerTableName: NotificationRegister
+    queueName: notification-queue-${sls:stage}
+    dlqName: notification-dlq-${sls:stage}
+    fifoQueueName: notification-fifo-${sls:stage}.fifo
+    fifoDlqName: notification-fifo-dlq-${sls:stage}.fifo
+    eventBusName: notification-events-${sls:stage}
+    idempotency:
+      pkPrefix: NOTIFICATION#IDEM
+      ttlSeconds: 86400  # 24 hours
+    ttlSeconds: 2592000  # 30 days
+    maxRetries: 5
+    visibilityTimeout: 60
+    batchSize: 10
+  pythonRequirements:
+    dockerizePip: non-linux
+    # For private packages from CodeArtifact, uncomment:
+    # pipCmdExtraArgs:
+    #   - --extra-index-url
+    #   - https://aws:${codeartifact-token}@your-domain.d.codeartifact.region.amazonaws.com/pypi/your-repo/simple/
+
+package:
+  patterns:
+    - "!packages/**"
+    - "!tests/**"
+    - "!.pytest_cache/**"
+    - "!__pycache__/**"
+    - "!*.md"
+    - "!node_modules/**"
+    - "handlers/**"
+
+functions:
+  payment:
+    handler: handlers.payment.payment_handler
+    environment:
+      IDEMPOTENCY_TABLE_NAME: ${self:custom.idempotency.tableName}
+      IDEMPOTENCY_PK_PREFIX: ${self:custom.payment.idempotency.pkPrefix}
+      IDEMPOTENCY_TTL_SECONDS: ${self:custom.payment.idempotency.ttlSeconds}
+    events:
+      - http:
+          path: /payments
+          method: POST
+
+  # Notification API handler (HTTP endpoint)
+  notificationApi:
+    handler: handlers.notification_api.notification_api_handler
+    timeout: 30
+    memorySize: 256
+    environment:
+      IDEMPOTENCY_TABLE_NAME: ${self:custom.idempotency.tableName}
+      IDEMPOTENCY_PK_PREFIX: ${self:custom.notification.idempotency.pkPrefix}
+      IDEMPOTENCY_TTL_SECONDS: ${self:custom.notification.idempotency.ttlSeconds}
+      NOTIFICATION_TABLE_NAME: ${self:custom.notification.tableName}
+      NOTIFICATION_REGISTER_TABLE_NAME: ${self:custom.notification.registerTableName}
+      NOTIFICATION_KMS_KEY_ID: !GetAtt NotificationKmsKey.Arn
+      NOTIFICATION_TTL_SECONDS: ${self:custom.notification.ttlSeconds}
+      NOTIFICATION_EVENT_BUS_NAME: ${self:custom.notification.eventBusName}
+    events:
+      - http:
+          path: /notifications
+          method: POST
+
+  # Notification worker handler (SQS consumer)
+  notificationWorker:
+    handler: handlers.notification_worker.notification_worker_handler
+    timeout: 30
+    memorySize: 256
+    environment:
+      NOTIFICATION_TABLE_NAME: ${self:custom.notification.tableName}
+      NOTIFICATION_REGISTER_TABLE_NAME: ${self:custom.notification.registerTableName}
+      NOTIFICATION_KMS_KEY_ID: !GetAtt NotificationKmsKey.Arn
+      NOTIFICATION_TTL_SECONDS: ${self:custom.notification.ttlSeconds}
+      SENDER_EMAIL: ${env:SENDER_EMAIL, 'noreply@example.com'}
+      SES_CONFIGURATION_SET: ${env:SES_CONFIGURATION_SET, ''}
+      SMS_SENDER_ID: ${env:SMS_SENDER_ID, ''}
+      SMS_TYPE: ${env:SMS_TYPE, 'Transactional'}
+    events:
+      # Standard queue for HIGH priority (high throughput)
+      - sqs:
+          arn: !GetAtt NotificationQueue.Arn
+          batchSize: ${self:custom.notification.batchSize}
+          functionResponseType: ReportBatchItemFailures
+      # FIFO queue for NORMAL priority (ordered by user)
+      - sqs:
+          arn: !GetAtt NotificationFifoQueue.Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    # Idempotency Table (uses AWS owned key for encryption at rest - default)
+    IdempotencyTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.idempotency.tableName}
+        AttributeDefinitions:
+          - AttributeName: IdempotencyKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: IdempotencyKey
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: TimeToLive
+          Enabled: true
+
+    # Customer Managed KMS Key for notification message encryption
+    NotificationKmsKey:
+      Type: AWS::KMS::Key
+      Properties:
+        Description: Customer managed key for notification message encryption
+        EnableKeyRotation: true
+        KeyPolicy:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: Enable IAM policies
+              Effect: Allow
+              Principal:
+                AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+              Action: kms:*
+              Resource: "*"
+            - Sid: Allow Lambda role to use the key
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt IamRoleLambdaExecution.Arn
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: "*"
+
+    NotificationKmsKeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: alias/notification-${sls:stage}
+        TargetKeyId: !Ref NotificationKmsKey
+
+    # Notification Table (single-table design)
+    NotificationTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.notification.tableName}
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK
+            AttributeType: S
+          - AttributeName: NotificationId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          # GSI1: Query by status (CREATED, PROCESSING, etc.)
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: GSI1PK
+                KeyType: HASH
+              - AttributeName: SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+          # GSI2: Lookup by NotificationId
+          - IndexName: NotificationIdIndex
+            KeySchema:
+              - AttributeName: NotificationId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: TimeToLive
+          Enabled: true
+
+    # Notification Register Table (user channel preferences)
+    NotificationRegisterTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.notification.registerTableName}
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+
+    # Notification Dead Letter Queue
+    NotificationDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.notification.dlqName}
+        MessageRetentionPeriod: 1209600  # 14 days
+
+    # Notification Queue with DLQ redrive policy
+    NotificationQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.notification.queueName}
+        VisibilityTimeout: ${self:custom.notification.visibilityTimeout}
+        MessageRetentionPeriod: 345600  # 4 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt NotificationDLQ.Arn
+          maxReceiveCount: ${self:custom.notification.maxRetries}
+
+    # FIFO Queue Dead Letter Queue (for HIGH priority)
+    NotificationFifoDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.notification.fifoDlqName}
+        FifoQueue: true
+        MessageRetentionPeriod: 1209600  # 14 days
+
+    # FIFO Queue for NORMAL priority notifications (ordered by user)
+    NotificationFifoQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.notification.fifoQueueName}
+        FifoQueue: true
+        ContentBasedDeduplication: false
+        VisibilityTimeout: ${self:custom.notification.visibilityTimeout}
+        MessageRetentionPeriod: 345600  # 4 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt NotificationFifoDLQ.Arn
+          maxReceiveCount: ${self:custom.notification.maxRetries}
+
+    # EventBridge Event Bus for notification events
+    NotificationEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:custom.notification.eventBusName}
+
+    # EventBridge Rule for HIGH priority -> Standard Queue (high throughput)
+    NotificationHighPriorityRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: notification-high-priority-${sls:stage}
+        EventBusName: !Ref NotificationEventBus
+        EventPattern:
+          source:
+            - notification.api
+          detail-type:
+            - NotificationCreated
+          detail:
+            priority:
+              - HIGH
+        Targets:
+          - Id: NotificationQueue
+            Arn: !GetAtt NotificationQueue.Arn
+
+    # EventBridge Rule for NORMAL priority -> FIFO Queue (ordered by user)
+    NotificationNormalPriorityRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: notification-normal-priority-${sls:stage}
+        EventBusName: !Ref NotificationEventBus
+        EventPattern:
+          source:
+            - notification.api
+          detail-type:
+            - NotificationCreated
+          detail:
+            priority:
+              - NORMAL
+        Targets:
+          - Id: NotificationFifoQueue
+            Arn: !GetAtt NotificationFifoQueue.Arn
+            SqsParameters:
+              MessageGroupId: $.detail.channel#$.detail.user_id
+              MessageDeduplicationId: $.detail.notification_id
+
+    # SQS Queue Policy for EventBridge to send messages
+    NotificationQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref NotificationQueue
+          - !Ref NotificationFifoQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                - !GetAtt NotificationQueue.Arn
+                - !GetAtt NotificationFifoQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    - !GetAtt NotificationHighPriorityRule.Arn
+                    - !GetAtt NotificationNormalPriorityRule.Arn
+
+  Outputs:
+    NotificationQueueUrl:
+      Description: URL of the notification SQS queue
+      Value: !Ref NotificationQueue
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationQueueUrl
+
+    NotificationQueueArn:
+      Description: ARN of the notification SQS queue
+      Value: !GetAtt NotificationQueue.Arn
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationQueueArn
+
+    NotificationDLQUrl:
+      Description: URL of the notification DLQ
+      Value: !Ref NotificationDLQ
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationDLQUrl
+
+    NotificationTableName:
+      Description: Name of the notification DynamoDB table
+      Value: !Ref NotificationTable
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationTableName
+
+    NotificationFifoQueueUrl:
+      Description: URL of the notification FIFO SQS queue
+      Value: !Ref NotificationFifoQueue
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationFifoQueueUrl
+
+    NotificationFifoQueueArn:
+      Description: ARN of the notification FIFO SQS queue
+      Value: !GetAtt NotificationFifoQueue.Arn
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationFifoQueueArn
+
+    NotificationEventBusArn:
+      Description: ARN of the notification EventBridge bus
+      Value: !GetAtt NotificationEventBus.Arn
+      Export:
+        Name: ${self:service}-${sls:stage}-NotificationEventBusArn
+
+plugins:
+  - serverless-python-requirements
