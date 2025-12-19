@@ -7,8 +7,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
@@ -24,10 +23,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class NotificationResult:
     success: bool
-    notification_id: Optional[str] = None
-    message_id: Optional[str] = None
-    channel: Optional[str] = None
-    error: Optional[str] = None
+    notification_id: str | None = None
+    message_id: str | None = None
+    channel: str | None = None
+    error: str | None = None
     retry: bool = False
 
 
@@ -166,7 +165,7 @@ class NotificationManager:
         metadata=None,
     ):
         notification_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         ttl = int(time.time()) + self.ttl_seconds
 
@@ -306,7 +305,9 @@ class NotificationManager:
             )
 
         try:
-            notification = self.update_status(notification, NotificationStatus.PROCESSING)
+            notification = self.update_status(
+                notification, NotificationStatus.PROCESSING
+            )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 logger.info("Notification %s already being processed", notification_id)
