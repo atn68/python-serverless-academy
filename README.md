@@ -1,4 +1,4 @@
-# Hometest
+# Python Lambda Serverless
 
 Serverless application with idempotent payment and notification handlers.
 

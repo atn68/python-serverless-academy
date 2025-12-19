@@ -7,7 +7,7 @@ name = "notification-lib"
 version = "0.1.0"
 description = "Notification library with AWS SES/SNS channel strategies"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.26.0",
     "cryptography>=41.0.0",
@@ -25,4 +25,4 @@ where = ["src"]
 
 [tool.black]
 line-length = 88
-target-version = ["py37"]
+target-version = ["py311", "py312"]

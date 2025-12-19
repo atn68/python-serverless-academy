@@ -2,7 +2,7 @@ service: python-serverless-academy
 
 provider:
   name: aws
-  runtime: python3.7
+  runtime: python3.11
   region: us-east-1
   iam:
     role:
